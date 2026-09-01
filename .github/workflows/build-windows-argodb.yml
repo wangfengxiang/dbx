@@ -76,6 +76,22 @@ jobs:
       - name: Generate connection types
         run: pnpm generate:connection-types
 
+      # Strip plugins.updater from tauri.conf.json before bundling so Tauri does
+      # not try to decode an empty signing key (TAURI_SIGNING_PRIVATE_KEY=""
+      # below) and abort the build with "Missing comment in secret key".
+      # The config is restored at the end of the job so other workflows are
+      # unaffected.
+      - name: Strip updater config for local test build
+        shell: pwsh
+        run: |
+          Copy-Item src-tauri/tauri.conf.json src-tauri/tauri.conf.json.bak
+          $json = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          if ($json.plugins.PSObject.Properties.Name -contains 'updater') {
+            $json.plugins.PSObject.Properties.Remove('updater')
+          }
+          $json | ConvertTo-Json -Depth 32 | Set-Content src-tauri/tauri.conf.json
+          Write-Host "Removed plugins.updater from tauri.conf.json"
+
       - name: Build Tauri app (Windows)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -116,3 +132,12 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
           retention-days: 30
+
+      - name: Restore original tauri.conf.json
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path src-tauri/tauri.conf.json.bak) {
+            Move-Item -Force src-tauri/tauri.conf.json.bak src-tauri/tauri.conf.json
+            Write-Host "Restored original tauri.conf.json"
+          }
