@@ -482,8 +482,8 @@ func metadataResult(columns []string, rows ...[]driver.Value) gohive.MetadataRes
 }
 
 func TestListObjectsIncludesProceduresAndFunctionsFromSystemViews(t *testing.T) {
-	proceduresQuery := "SELECT procedure_name FROM system.procedures_v WHERE lower(database_name) = lower('ods') AND lower(procedure_name) LIKE '%sp%' ORDER BY procedure_name"
-	functionsQuery := "SELECT function_name FROM system.functions_v WHERE lower(database_name) = lower('ods') AND lower(function_name) LIKE '%sp%' ORDER BY function_name"
+	proceduresQuery := "SELECT procedure_name, database_name FROM system.procedures_v WHERE lower(database_name) = lower('ods') AND lower(procedure_name) LIKE '%sp%' ORDER BY database_name, procedure_name"
+	functionsQuery := "SELECT function_name, database_name FROM system.functions_v WHERE lower(database_name) = lower('ods') AND lower(function_name) LIKE '%sp%' ORDER BY database_name, function_name"
 	behavior := &scriptedBehavior{
 		query: func(_ context.Context, query string) (driver.Rows, error) {
 			switch query {
@@ -573,7 +573,11 @@ func TestGetObjectSourceRoutesProceduresToSystemProceduresView(t *testing.T) {
 	if source.Name != "sp_daily_etl" || source.ObjectType != "PROCEDURE" {
 		t.Fatalf("unexpected object source metadata: %#v", source)
 	}
-	expected := "-- daily ETL pipeline\nINSERT OVERWRITE TABLE ods.daily_summary SELECT * FROM staging.events\n"
+	// full_text rows are length-split by the driver, not line-split, so the
+	// agent concatenates them with no separator between rows. Only a trailing
+	// newline is appended so callers reading the source string by line keep
+	// the previous convention.
+	expected := "-- daily ETL pipelineINSERT OVERWRITE TABLE ods.daily_summary SELECT * FROM staging.events\n"
 	if source.Source != expected {
 		t.Fatalf("unexpected procedure source: %q", source.Source)
 	}

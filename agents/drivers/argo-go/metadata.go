@@ -489,21 +489,22 @@ func (server *server) listRoutines(schema string, constraints metadataListConstr
 		nameColumn = "function_name"
 		viewName = "system.functions_v"
 	}
-	// Routine listings are pinned to the active schema (or the connection's default
-	// database when the caller passes an empty schema). system.procedures_v /
-	// system.functions_v only contain rows for one specific database per query;
-	// there is no wildcard form. Falling back to the connection default keeps
-	// callers like the sidebar schema tree happy when they pass "" as the schema.
-	targetSchema := firstNonEmpty(schema, server.config.Database)
 	likePattern := buildRoutineLikePattern(constraints.Filter)
-	// database_name is a string column, so the schema filter must be a single-quoted
-	// literal — not a backtick-quoted identifier. ArgoDB/Inceptor reject lower(`ods`)
-	// against system.procedures_v with an ERROR_STATUS, while lower('ods') works.
-	schemaLiteral := "'" + strings.ReplaceAll(targetSchema, "'", "''") + "'"
-	sql := "SELECT " + nameColumn + " FROM " + viewName +
-		" WHERE lower(database_name) = lower(" + schemaLiteral + ")" +
+	// When the caller passes a non-empty schema, pin the query to that database
+	// (database_name is a string column — no wildcard form). Otherwise scan every
+	// database the server has routines in and return them with their actual
+	// database_name so callers like the MCP dbx_list_routines tool and the
+	// desktop sidebar can present routines without forcing the user to know
+	// which schema holds them.
+	targetSchema := schema
+	var schemaFilter string
+	if targetSchema != "" {
+		targetSchema = firstNonEmpty(targetSchema, server.config.Database)
+		schemaFilter = " WHERE lower(database_name) = lower('" + strings.ReplaceAll(targetSchema, "'", "''") + "')"
+	}
+	sql := "SELECT " + nameColumn + ", database_name FROM " + viewName + schemaFilter +
 		" AND lower(" + nameColumn + ") LIKE " + likePattern +
-		" ORDER BY " + nameColumn
+		" ORDER BY database_name, " + nameColumn
 	result, err := server.executeQuery(queryOptions{SQL: sql, MaxRows: metadataQueryLimit})
 	if err != nil {
 		// View missing or not supported — silently return empty list.
@@ -515,7 +516,13 @@ func (server *server) listRoutines(schema string, constraints metadataListConstr
 		if name == "" {
 			continue
 		}
-		values = append(values, objectInfo{Name: name, ObjectType: strings.ToUpper(routineType), Schema: schema, Comment: nil})
+		dbName := rowString(row, 1)
+		if schema != "" {
+			// Caller pinned a specific schema — preserve the requested name
+			// instead of leaking the catalog's own database_name column.
+			dbName = schema
+		}
+		values = append(values, objectInfo{Name: name, ObjectType: strings.ToUpper(routineType), Schema: dbName, Comment: nil})
 	}
 	return values, nil
 }
@@ -717,23 +724,62 @@ func (server *server) getRoutineSource(schema, name, routineType string) (string
 		nameColumn = "function_name"
 		viewName = "system.functions_v"
 	}
-	sql := "SELECT full_text FROM " + viewName +
-		" WHERE lower(database_name) = lower('" + strings.ReplaceAll(schema, "'", "''") + "')" +
-		" AND " + nameColumn + " = '" + strings.ReplaceAll(name, "'", "''") + "'"
-	result, err := server.executeQuery(queryOptions{SQL: sql, MaxRows: metadataQueryLimit})
+	effectiveSchema := firstNonEmpty(schema, server.config.Database)
+	quotedName := "'" + strings.ReplaceAll(name, "'", "''") + "'"
+	quotedSchema := "'" + strings.ReplaceAll(effectiveSchema, "'", "''") + "'"
+
+	// full_text may span multiple rows (the underlying query driver splits long
+	// strings), so we join them like getTableDDL does.
+	loadSource := func(dbFilter string) (string, error) {
+		var sql string
+		if dbFilter == "" {
+			// Caller left the schema unset; pick the first database that has
+			// the routine so users don't have to know which schema holds it.
+			lookupSQL := "SELECT database_name FROM " + viewName +
+				" WHERE lower(" + nameColumn + ") = lower(" + quotedName + ")" +
+				" ORDER BY database_name LIMIT 1"
+			lookup, err := server.executeQuery(queryOptions{SQL: lookupSQL, MaxRows: 1})
+			if err != nil || len(lookup.Rows) == 0 {
+				return "", nil
+			}
+			dbName := rowString(lookup.Rows[0], 0)
+			if dbName == "" {
+				return "", nil
+			}
+			sql = "SELECT full_text FROM " + viewName +
+				" WHERE lower(database_name) = lower('" + strings.ReplaceAll(dbName, "'", "''") + "')" +
+				" AND " + nameColumn + " = " + quotedName
+		} else {
+			sql = "SELECT full_text FROM " + viewName +
+				" WHERE " + dbFilter + " = lower(" + quotedSchema + ")" +
+				" AND " + nameColumn + " = " + quotedName
+		}
+		result, err := server.executeQuery(queryOptions{SQL: sql, MaxRows: metadataQueryLimit})
+		if err != nil {
+			return "", nil
+		}
+		lines := make([]string, 0, len(result.Rows))
+		for _, row := range result.Rows {
+			if line := firstRowValue(row); line != "" {
+				lines = append(lines, line)
+			}
+		}
+		if len(lines) == 0 {
+			return "", nil
+		}
+		return strings.Join(lines, "") + "\n", nil
+	}
+
+	source, err := loadSource("lower(database_name)")
 	if err != nil {
 		return "", nil
 	}
-	lines := make([]string, 0, len(result.Rows))
-	for _, row := range result.Rows {
-		if line := firstRowValue(row); line != "" {
-			lines = append(lines, line)
-		}
+	if source != "" {
+		return source, nil
 	}
-	if len(lines) == 0 {
-		return "", nil
-	}
-	return strings.Join(lines, "\n") + "\n", nil
+	// Fall back to a server-wide lookup so callers don't have to know exactly
+	// which database the routine lives in.
+	return loadSource("")
 }
 
 func (server *server) getExplainInfo(sqlText string) (string, error) {
